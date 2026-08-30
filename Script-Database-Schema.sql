@@ -1,44 +1,65 @@
 /*==============================================================================
   Script-Database-Schema.sql
 
-  Generates a CREATE script for an entire SQL Server database schema using
-  nothing but T-SQL -- no SMO, PowerShell, SSMS wizard or linked tools.
-  Run it in the database you want to script (USE YourDb first).
+  Scripts out a SQL Server database schema -- tables, views, functions, stored
+  procedures, triggers, indexes, constraints, types, everything -- using nothing
+  but T-SQL. No SMO, no PowerShell, no SSMS wizard. Run it in the database you
+  want to script (USE YourDb first) and capture the output.
 
-  What it emits, in dependency-safe order:
-      1.  Schemas
-      2.  User-defined data types (alias types) and table types
-      3.  Sequences
-      4.  Tables (columns, computed columns, identity, collation, sparse,
-          rowguidcol)
-      5.  Primary key / unique constraints
-      6.  Default constraints
-      7.  Check constraints
-      8.  Indexes (rowstore, incl. INCLUDE columns and filters; columnstore)
-      9.  Views (optionally ordered so view-on-view dependencies resolve)
-     10.  Scalar / table-valued functions
-     11.  Stored procedures
-     12.  Triggers (DML and database-level DDL), incl. DISABLE for disabled ones
-     13.  Foreign keys (last, so every referenced table already exists)
-     14.  Synonyms
-     15.  Extended properties (MS_Description etc.)
-     16.  Object-level permissions (optional, off by default)
+  Built for a large ERP schema (SyteLine / CloudSuite Industrial), so it runs in
+  PHASES. Start at phase 1, check what comes back, move up. Set @Phase = 99 to
+  take the whole thing in one pass on a small database.
 
-  Configure the block of variables below, run, and take the output.
+      PHASE 1  FOUNDATION        schemas, alias types, table types, sequences
+      PHASE 2  TABLES            CREATE TABLE + primary key / unique
+      PHASE 3  INTEGRITY         defaults, check constraints, indexes
+      PHASE 4  RELATIONS         foreign keys
+      PHASE 5  VIEWS + FUNCTIONS dependency-ordered together
+      PHASE 6  PROCEDURES
+      PHASE 7  TRIGGERS
+      PHASE 8  EXTRAS            synonyms, extended properties, permissions
+
+  The phases replay in numeric order on an empty database: types before the
+  tables that use them, tables before their indexes, everything before the
+  foreign keys that tie them together.
+
+  Phases 2, 3, 4, 6 and 7 can be split further with @PartCount / @PartNumber
+  when one phase is still too big to handle in one file. Phase 5 cannot be
+  split -- see the note on it below.
+
+  WHY VIEWS AND FUNCTIONS SHARE A PHASE
+  CREATE VIEW and CREATE FUNCTION resolve their references at creation time.
+  Stored procedures and triggers get deferred name resolution and will compile
+  against objects that do not exist yet; views and functions will not. So those
+  two are emitted together, in one dependency order (a view over a view, a view
+  calling a function, a function selecting from a view), and never split.
+
+  SYTELINE NOTES
+    * Every SyteLine column is declared with an alias type -- AmountType,
+      VendNumType, DateType -- so phase 1 is not optional. Emit the types first
+      or every CREATE TABLE in phase 2 fails.
+    * The _mst / _all / site-view layering falls out naturally: _mst tables come
+      in phase 2, the _all and site views in phase 5, in the right order.
+    * Objects Infor ships are user objects (is_ms_shipped = 0), so they are all
+      in scope. @CustomObjectsOnly narrows to the uf_ / Uf_ / MMC_ naming
+      convention, but custom COLUMNS live inside stock tables and that switch
+      will not find them -- Phase-0-Inventory.sql reports those separately.
+    * Read-only: catalog SELECTs under READ UNCOMMITTED. It takes no locks a
+      clerk would notice and writes nothing.
 
   OUTPUT MODES (@OutputMode)
-      'PRINT'   Prints the whole script to the Messages tab, chunked at line
-                boundaries so nothing is truncated. Best for copy/paste or
-                for sqlcmd redirection to a .sql file.
-      'ROWS'    Returns one row per statement (schema, object, type, text).
-                Best for eyeballing or for filtering further.
-      'SINGLE'  Returns the whole script in one nvarchar(max) cell.
-                Set SSMS: Tools > Options > Query Results > SQL Server >
-                Results to Grid > Maximum Characters Retrieved > 2000000,
-                or use Results to Text.
+      'PRINT'   Prints the script to the Messages tab, chunked at line
+                boundaries so nothing is truncated. This is the one to use with
+                sqlcmd -o.
+      'ROWS'    One row per statement (schema, object, type, text).
+      'SINGLE'  The whole script in one nvarchar(max) cell. In SSMS raise
+                Tools > Options > Query Results > SQL Server > Results to Grid >
+                Maximum Characters Retrieved first, or it gets clipped.
 
-  To write straight to a file from the command line:
-      sqlcmd -S server -d YourDb -E -i Script-Database-Schema.sql -o schema.sql
+  RUNNING ONE PHASE FROM THE COMMAND LINE
+      sqlcmd -S server -d MMC_V10 -E -b -i Script-Database-Schema.sql -o phase.sql
+  Export-SytelineSchema.ps1 in this repo drives all the phases in order and
+  writes one numbered file per phase, plus a master file that replays them.
 
   KNOWN LIMITATIONS (deliberate -- kept out to keep the script readable)
       * Filegroups, partition schemes/functions, FILESTREAM and
@@ -56,12 +77,47 @@
 ==============================================================================*/
 
 SET NOCOUNT ON;
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;   -- never block clerks
 
 --------------------------------------------------------------------------------
 -- Configuration
 --------------------------------------------------------------------------------
+-- Which slice of the schema to emit. On a small database leave this at 99 and
+-- take the lot; on an ERP schema work up through the phases one at a time.
+--
+--    1  FOUNDATION   schemas, alias types, table types, sequences
+--    2  TABLES       CREATE TABLE + primary key / unique constraints
+--    3  INTEGRITY    defaults, check constraints, indexes
+--    4  RELATIONS    foreign keys
+--    5  PROGRAMMABILITY-1  views and functions, dependency-ordered together
+--    6  PROCEDURES
+--    7  TRIGGERS
+--    8  EXTRAS       synonyms, extended properties, permissions
+--   99  ALL          every phase in one pass
+--
+-- Phases replay in numeric order, so 1..8 concatenated == 99.
+DECLARE @Phase                      int = 99;
+
+-- Split one phase across several runs. Phase 6 on a SyteLine database is
+-- thousands of procedures; @PartCount = 8 with @PartNumber 1..8 gives eight
+-- files you can generate and review separately. Bucketing is by object name,
+-- so a given table lands in the same part in every phase, and part 1 is the
+-- only part that carries the small one-off sections.
+--
+-- Phase 5 ignores @PartCount: views and functions bind at creation time, so
+-- they have to be emitted whole, in one dependency order.
+DECLARE @PartCount                  int = 1;
+DECLARE @PartNumber                 int = 1;
+
 DECLARE @SchemaFilter               nvarchar(4000) = NULL;   -- N'dbo,sales'  NULL = every schema
 DECLARE @NameFilter                 nvarchar(4000) = NULL;   -- LIKE pattern, e.g. N'usp[_]%'  NULL = every object
+DECLARE @ExcludeNameLike            nvarchar(4000) = NULL;   -- comma-separated LIKE patterns to drop,
+                                                             -- e.g. N'%_all,%_wa,tmp[_]%'
+DECLARE @CustomObjectsOnly          bit = 0;   -- keep only objects named per Infor's custom-object
+                                               -- convention: uf_%, Uf_%, MMC_%. Note that custom
+                                               -- COLUMNS (uf_...) live inside stock tables, so this
+                                               -- switch will not find them -- Phase-0-Inventory.sql
+                                               -- reports those separately.
 
 DECLARE @IncludeSchemas             bit = 1;
 DECLARE @IncludeUserDefinedTypes    bit = 1;
@@ -81,8 +137,46 @@ DECLARE @IncludeExtendedProperties  bit = 1;
 DECLARE @IncludePermissions         bit = 0;   -- GRANT / DENY on objects
 
 DECLARE @DropIfExists               bit = 0;   -- prefix modules and synonyms with a drop guard
-DECLARE @OrderViewsByDependency     bit = 1;   -- topologically sort view-on-view references
+DECLARE @OrderByDependency     bit = 1;   -- topologically sort view-on-view references
 DECLARE @OutputMode                 varchar(10) = 'PRINT';   -- 'PRINT' | 'ROWS' | 'SINGLE'
+
+--------------------------------------------------------------------------------
+-- Phase presets
+--   A phase other than 99 overrides the @Include* switches above. Set @Phase to
+--   99 if you want to drive the switches by hand.
+--------------------------------------------------------------------------------
+IF @Phase <> 99
+BEGIN
+    SELECT @IncludeSchemas            = 0, @IncludeUserDefinedTypes = 0,
+           @IncludeSequences          = 0, @IncludeTables           = 0,
+           @IncludeKeyConstraints     = 0, @IncludeDefaults         = 0,
+           @IncludeCheckConstraints   = 0, @IncludeIndexes          = 0,
+           @IncludeViews              = 0, @IncludeFunctions        = 0,
+           @IncludeProcedures         = 0, @IncludeTriggers         = 0,
+           @IncludeForeignKeys        = 0, @IncludeSynonyms         = 0,
+           @IncludeExtendedProperties = 0, @IncludePermissions      = 0;
+
+    IF @Phase = 1 SELECT @IncludeSchemas = 1, @IncludeUserDefinedTypes = 1, @IncludeSequences = 1;
+    IF @Phase = 2 SELECT @IncludeTables = 1, @IncludeKeyConstraints = 1;
+    IF @Phase = 3 SELECT @IncludeDefaults = 1, @IncludeCheckConstraints = 1, @IncludeIndexes = 1;
+    IF @Phase = 4 SELECT @IncludeForeignKeys = 1;
+    IF @Phase = 5 SELECT @IncludeViews = 1, @IncludeFunctions = 1;
+    IF @Phase = 6 SELECT @IncludeProcedures = 1;
+    IF @Phase = 7 SELECT @IncludeTriggers = 1;
+    IF @Phase = 8 SELECT @IncludeSynonyms = 1, @IncludeExtendedProperties = 1, @IncludePermissions = 1;
+END
+
+IF @PartCount < 1 SET @PartCount = 1;
+IF @PartNumber < 1 OR @PartNumber > @PartCount
+BEGIN
+    RAISERROR('@PartNumber must be between 1 and @PartCount.', 16, 1);
+    RETURN;
+END
+
+-- The small one-off sections (schemas, types, sequences, synonyms, extended
+-- properties, permissions) are emitted by part 1 only, so splitting a phase
+-- never duplicates them.
+DECLARE @FirstPart bit = CASE WHEN @PartNumber = 1 THEN 1 ELSE 0 END;
 
 --------------------------------------------------------------------------------
 -- Working storage
@@ -93,8 +187,8 @@ DECLARE @majorVersion int = CONVERT(int, PARSENAME(CONVERT(varchar(50), SERVERPR
 
 IF OBJECT_ID('tempdb..#script')       IS NOT NULL DROP TABLE #script;
 IF OBJECT_ID('tempdb..#schema_filter') IS NOT NULL DROP TABLE #schema_filter;
-IF OBJECT_ID('tempdb..#view_dep')      IS NOT NULL DROP TABLE #view_dep;
-IF OBJECT_ID('tempdb..#view_level')    IS NOT NULL DROP TABLE #view_level;
+IF OBJECT_ID('tempdb..#module_dep')    IS NOT NULL DROP TABLE #module_dep;
+IF OBJECT_ID('tempdb..#module_level')  IS NOT NULL DROP TABLE #module_level;
 
 CREATE TABLE #script
 (
@@ -107,14 +201,17 @@ CREATE TABLE #script
     script_text nvarchar(max) NOT NULL
 );
 
-CREATE TABLE #schema_filter (name sysname NOT NULL PRIMARY KEY);
+CREATE TABLE #schema_filter    (name sysname NOT NULL PRIMARY KEY);
+CREATE TABLE #exclude_pattern  (pattern nvarchar(200) NOT NULL PRIMARY KEY);
 
 -- Split @SchemaFilter on commas.
+DECLARE @rest nvarchar(4000);
+DECLARE @one  nvarchar(4000);
+DECLARE @pos  int;
+
 IF @SchemaFilter IS NOT NULL
 BEGIN
-    DECLARE @rest nvarchar(4000) = @SchemaFilter + N',';
-    DECLARE @one  nvarchar(4000);
-    DECLARE @pos  int;
+    SET @rest = @SchemaFilter + N',';
 
     WHILE CHARINDEX(N',', @rest) > 0
     BEGIN
@@ -127,10 +224,26 @@ BEGIN
     END
 END
 
+-- Split @ExcludeNameLike on commas. Each element is a LIKE pattern.
+IF @ExcludeNameLike IS NOT NULL
+BEGIN
+    SET @rest = @ExcludeNameLike + N',';
+
+    WHILE CHARINDEX(N',', @rest) > 0
+    BEGIN
+        SET @pos  = CHARINDEX(N',', @rest);
+        SET @one  = LTRIM(RTRIM(LEFT(@rest, @pos - 1)));
+        SET @rest = SUBSTRING(@rest, @pos + 1, LEN(@rest + N'|'));
+
+        IF @one <> N'' AND NOT EXISTS (SELECT 1 FROM #exclude_pattern WHERE pattern = @one)
+            INSERT #exclude_pattern (pattern) VALUES (@one);
+    END
+END
+
 --------------------------------------------------------------------------------
 -- 1. Schemas
 --------------------------------------------------------------------------------
-IF @IncludeSchemas = 1
+IF @IncludeSchemas = 1 AND @FirstPart = 1
     INSERT #script (sort_order, object_type, schema_name, object_name, script_text)
     SELECT 100, 'SCHEMA', s.name, s.name,
            N'IF NOT EXISTS (SELECT 1 FROM sys.schemas WHERE name = ' + QUOTENAME(s.name, '''') + N')' + @crlf +
@@ -145,7 +258,7 @@ IF @IncludeSchemas = 1
 --------------------------------------------------------------------------------
 -- 2a. User-defined data types (alias types)
 --------------------------------------------------------------------------------
-IF @IncludeUserDefinedTypes = 1
+IF @IncludeUserDefinedTypes = 1 AND @FirstPart = 1
     INSERT #script (sort_order, object_type, schema_name, object_name, script_text)
     SELECT 200, 'TYPE', s.name, t.name,
            N'CREATE TYPE ' + QUOTENAME(s.name) + N'.' + QUOTENAME(t.name) + N' FROM ' +
@@ -170,12 +283,17 @@ IF @IncludeUserDefinedTypes = 1
       AND  t.is_table_type = 0
       AND  t.is_assembly_type = 0
       AND  (@SchemaFilter IS NULL OR s.name IN (SELECT name FROM #schema_filter))
-      AND  (@NameFilter IS NULL OR t.name LIKE @NameFilter);
+      AND  (@NameFilter IS NULL OR t.name LIKE @NameFilter)
+      AND  (@ExcludeNameLike IS NULL OR NOT EXISTS
+                (SELECT 1 FROM #exclude_pattern x WHERE t.name LIKE x.pattern))
+      AND  (@CustomObjectsOnly = 0 OR t.name LIKE N'uf[_]%'
+                                   OR t.name LIKE N'Uf[_]%'
+                                   OR t.name LIKE N'MMC[_]%');
 
 --------------------------------------------------------------------------------
 -- 2b. User-defined table types
 --------------------------------------------------------------------------------
-IF @IncludeUserDefinedTypes = 1
+IF @IncludeUserDefinedTypes = 1 AND @FirstPart = 1
     INSERT #script (sort_order, object_type, schema_name, object_name, script_text)
     SELECT 210, 'TABLE TYPE', s.name, tt.name,
            N'CREATE TYPE ' + QUOTENAME(s.name) + N'.' + QUOTENAME(tt.name) + N' AS TABLE' + @crlf + N'(' +
@@ -237,13 +355,18 @@ IF @IncludeUserDefinedTypes = 1
     JOIN   sys.schemas s ON s.schema_id = tt.schema_id
     WHERE  tt.is_user_defined = 1
       AND  (@SchemaFilter IS NULL OR s.name IN (SELECT name FROM #schema_filter))
-      AND  (@NameFilter IS NULL OR tt.name LIKE @NameFilter);
+      AND  (@NameFilter IS NULL OR tt.name LIKE @NameFilter)
+      AND  (@ExcludeNameLike IS NULL OR NOT EXISTS
+                (SELECT 1 FROM #exclude_pattern x WHERE tt.name LIKE x.pattern))
+      AND  (@CustomObjectsOnly = 0 OR tt.name LIKE N'uf[_]%'
+                                   OR tt.name LIKE N'Uf[_]%'
+                                   OR tt.name LIKE N'MMC[_]%');
 
 --------------------------------------------------------------------------------
 -- 3. Sequences (SQL Server 2012+; queried dynamically so the batch still
 --    compiles on older versions)
 --------------------------------------------------------------------------------
-IF @IncludeSequences = 1 AND @majorVersion >= 11
+IF @IncludeSequences = 1 AND @FirstPart = 1 AND @majorVersion >= 11
 BEGIN
     DECLARE @seqSql nvarchar(max) = N'
     INSERT #script (sort_order, object_type, schema_name, object_name, script_text)
@@ -330,7 +453,13 @@ IF @IncludeTables = 1
     WHERE  t.is_ms_shipped = 0
       AND  t.name <> N'sysdiagrams'
       AND  (@SchemaFilter IS NULL OR s.name IN (SELECT name FROM #schema_filter))
-      AND  (@NameFilter IS NULL OR t.name LIKE @NameFilter);
+      AND  (@NameFilter IS NULL OR t.name LIKE @NameFilter)
+      AND  (@ExcludeNameLike IS NULL OR NOT EXISTS
+                (SELECT 1 FROM #exclude_pattern x WHERE t.name LIKE x.pattern))
+      AND  (@CustomObjectsOnly = 0 OR t.name LIKE N'uf[_]%'
+                                   OR t.name LIKE N'Uf[_]%'
+                                   OR t.name LIKE N'MMC[_]%')
+      AND  (@PartCount = 1 OR ABS(CHECKSUM(t.name)) % @PartCount = @PartNumber - 1);
 
 --------------------------------------------------------------------------------
 -- 5. Primary key and unique constraints
@@ -360,7 +489,13 @@ IF @IncludeKeyConstraints = 1
     WHERE  t.is_ms_shipped = 0
       AND  t.name <> N'sysdiagrams'
       AND  (@SchemaFilter IS NULL OR s.name IN (SELECT name FROM #schema_filter))
-      AND  (@NameFilter IS NULL OR t.name LIKE @NameFilter);
+      AND  (@NameFilter IS NULL OR t.name LIKE @NameFilter)
+      AND  (@ExcludeNameLike IS NULL OR NOT EXISTS
+                (SELECT 1 FROM #exclude_pattern x WHERE t.name LIKE x.pattern))
+      AND  (@CustomObjectsOnly = 0 OR t.name LIKE N'uf[_]%'
+                                   OR t.name LIKE N'Uf[_]%'
+                                   OR t.name LIKE N'MMC[_]%')
+      AND  (@PartCount = 1 OR ABS(CHECKSUM(t.name)) % @PartCount = @PartNumber - 1);
 
 --------------------------------------------------------------------------------
 -- 6. Default constraints
@@ -378,7 +513,13 @@ IF @IncludeDefaults = 1
     WHERE  t.is_ms_shipped = 0
       AND  t.name <> N'sysdiagrams'
       AND  (@SchemaFilter IS NULL OR s.name IN (SELECT name FROM #schema_filter))
-      AND  (@NameFilter IS NULL OR t.name LIKE @NameFilter);
+      AND  (@NameFilter IS NULL OR t.name LIKE @NameFilter)
+      AND  (@ExcludeNameLike IS NULL OR NOT EXISTS
+                (SELECT 1 FROM #exclude_pattern x WHERE t.name LIKE x.pattern))
+      AND  (@CustomObjectsOnly = 0 OR t.name LIKE N'uf[_]%'
+                                   OR t.name LIKE N'Uf[_]%'
+                                   OR t.name LIKE N'MMC[_]%')
+      AND  (@PartCount = 1 OR ABS(CHECKSUM(t.name)) % @PartCount = @PartNumber - 1);
 
 --------------------------------------------------------------------------------
 -- 7. Check constraints
@@ -401,7 +542,13 @@ IF @IncludeCheckConstraints = 1
     WHERE  t.is_ms_shipped = 0
       AND  cc.is_ms_shipped = 0
       AND  (@SchemaFilter IS NULL OR s.name IN (SELECT name FROM #schema_filter))
-      AND  (@NameFilter IS NULL OR t.name LIKE @NameFilter);
+      AND  (@NameFilter IS NULL OR t.name LIKE @NameFilter)
+      AND  (@ExcludeNameLike IS NULL OR NOT EXISTS
+                (SELECT 1 FROM #exclude_pattern x WHERE t.name LIKE x.pattern))
+      AND  (@CustomObjectsOnly = 0 OR t.name LIKE N'uf[_]%'
+                                   OR t.name LIKE N'Uf[_]%'
+                                   OR t.name LIKE N'MMC[_]%')
+      AND  (@PartCount = 1 OR ABS(CHECKSUM(t.name)) % @PartCount = @PartNumber - 1);
 
 --------------------------------------------------------------------------------
 -- 8a. Rowstore indexes (clustered / nonclustered, not backing a constraint)
@@ -453,7 +600,13 @@ IF @IncludeIndexes = 1
       AND  i.is_hypothetical = 0
       AND  i.name IS NOT NULL
       AND  (@SchemaFilter IS NULL OR s.name IN (SELECT name FROM #schema_filter))
-      AND  (@NameFilter IS NULL OR t.name LIKE @NameFilter);
+      AND  (@NameFilter IS NULL OR t.name LIKE @NameFilter)
+      AND  (@ExcludeNameLike IS NULL OR NOT EXISTS
+                (SELECT 1 FROM #exclude_pattern x WHERE t.name LIKE x.pattern))
+      AND  (@CustomObjectsOnly = 0 OR t.name LIKE N'uf[_]%'
+                                   OR t.name LIKE N'Uf[_]%'
+                                   OR t.name LIKE N'MMC[_]%')
+      AND  (@PartCount = 1 OR ABS(CHECKSUM(t.name)) % @PartCount = @PartNumber - 1);
 
 --------------------------------------------------------------------------------
 -- 8b. Columnstore indexes
@@ -480,38 +633,69 @@ IF @IncludeIndexes = 1
       AND  i.type IN (5, 6)
       AND  i.name IS NOT NULL
       AND  (@SchemaFilter IS NULL OR s.name IN (SELECT name FROM #schema_filter))
-      AND  (@NameFilter IS NULL OR t.name LIKE @NameFilter);
+      AND  (@NameFilter IS NULL OR t.name LIKE @NameFilter)
+      AND  (@ExcludeNameLike IS NULL OR NOT EXISTS
+                (SELECT 1 FROM #exclude_pattern x WHERE t.name LIKE x.pattern))
+      AND  (@CustomObjectsOnly = 0 OR t.name LIKE N'uf[_]%'
+                                   OR t.name LIKE N'Uf[_]%'
+                                   OR t.name LIKE N'MMC[_]%')
+      AND  (@PartCount = 1 OR ABS(CHECKSUM(t.name)) % @PartCount = @PartNumber - 1);
 
 --------------------------------------------------------------------------------
--- 9. Views
---    Emitted in dependency order when @OrderViewsByDependency = 1, so a view
---    built on another view is created after the view it reads.
+-- 9. Views and functions
+--    These two are emitted together, in one dependency order, on purpose.
+--    CREATE VIEW and CREATE FUNCTION bind at creation time -- unlike procedures
+--    and triggers they get no deferred name resolution -- so a view built on
+--    another view, a view calling a scalar function, or a function selecting
+--    from a view all have to be created in the right order or the replay
+--    fails. They are also never split by @PartCount for the same reason.
 --------------------------------------------------------------------------------
-CREATE TABLE #view_level (object_id int NOT NULL PRIMARY KEY, depth int NOT NULL);
+CREATE TABLE #module_level (object_id int NOT NULL PRIMARY KEY, depth int NOT NULL);
 
-IF @IncludeViews = 1
+IF (@IncludeViews = 1 OR @IncludeFunctions = 1) AND @FirstPart = 1
 BEGIN
-    INSERT #view_level (object_id, depth)
-    SELECT v.object_id, 0
-    FROM   sys.views v
-    JOIN   sys.schemas s ON s.schema_id = v.schema_id
-    WHERE  v.is_ms_shipped = 0
-      AND  (@SchemaFilter IS NULL OR s.name IN (SELECT name FROM #schema_filter))
-      AND  (@NameFilter IS NULL OR v.name LIKE @NameFilter);
+    IF @IncludeViews = 1
+        INSERT #module_level (object_id, depth)
+        SELECT v.object_id, 0
+        FROM   sys.views v
+        JOIN   sys.schemas s ON s.schema_id = v.schema_id
+        WHERE  v.is_ms_shipped = 0
+          AND  (@SchemaFilter IS NULL OR s.name IN (SELECT name FROM #schema_filter))
+          AND  (@NameFilter IS NULL OR v.name LIKE @NameFilter)
+          AND  (@ExcludeNameLike IS NULL OR NOT EXISTS
+                    (SELECT 1 FROM #exclude_pattern x WHERE v.name LIKE x.pattern))
+          AND  (@CustomObjectsOnly = 0 OR v.name LIKE N'uf[_]%'
+                                       OR v.name LIKE N'Uf[_]%'
+                                       OR v.name LIKE N'MMC[_]%');
 
-    IF @OrderViewsByDependency = 1
+    IF @IncludeFunctions = 1
+        INSERT #module_level (object_id, depth)
+        SELECT o.object_id, 0
+        FROM   sys.objects o
+        JOIN   sys.schemas s ON s.schema_id = o.schema_id
+        WHERE  o.type IN ('FN', 'IF', 'TF')
+          AND  o.is_ms_shipped = 0
+          AND  (@SchemaFilter IS NULL OR s.name IN (SELECT name FROM #schema_filter))
+          AND  (@NameFilter IS NULL OR o.name LIKE @NameFilter)
+          AND  (@ExcludeNameLike IS NULL OR NOT EXISTS
+                    (SELECT 1 FROM #exclude_pattern x WHERE o.name LIKE x.pattern))
+          AND  (@CustomObjectsOnly = 0 OR o.name LIKE N'uf[_]%'
+                                       OR o.name LIKE N'Uf[_]%'
+                                       OR o.name LIKE N'MMC[_]%');
+
+    IF @OrderByDependency = 1
     BEGIN
-        CREATE TABLE #view_dep (referencing_id int NOT NULL, referenced_id int NOT NULL,
-                                PRIMARY KEY (referencing_id, referenced_id));
+        CREATE TABLE #module_dep (referencing_id int NOT NULL, referenced_id int NOT NULL,
+                                  PRIMARY KEY (referencing_id, referenced_id));
 
-        INSERT #view_dep (referencing_id, referenced_id)
+        INSERT #module_dep (referencing_id, referenced_id)
         SELECT DISTINCT d.referencing_id, d.referenced_id
         FROM   sys.sql_expression_dependencies d
-        JOIN   #view_level a ON a.object_id = d.referencing_id
-        JOIN   #view_level b ON b.object_id = d.referenced_id
+        JOIN   #module_level a ON a.object_id = d.referencing_id
+        JOIN   #module_level b ON b.object_id = d.referenced_id
         WHERE  d.referenced_id <> d.referencing_id;
 
-        -- Iteratively push dependents above the views they read. Bounded, so a
+        -- Push each module above everything it reads. Bounded, so a
         -- pathological graph cannot spin forever.
         DECLARE @pass int = 0;
         DECLARE @moved int = 1;
@@ -520,20 +704,24 @@ BEGIN
         BEGIN
             UPDATE l
             SET    l.depth = x.max_depth + 1
-            FROM   #view_level l
-            JOIN   (SELECT vd.referencing_id, MAX(p.depth) AS max_depth
-                    FROM   #view_dep vd
-                    JOIN   #view_level p ON p.object_id = vd.referenced_id
-                    GROUP  BY vd.referencing_id) x ON x.referencing_id = l.object_id
+            FROM   #module_level l
+            JOIN   (SELECT md.referencing_id, MAX(p.depth) AS max_depth
+                    FROM   #module_dep md
+                    JOIN   #module_level p ON p.object_id = md.referenced_id
+                    GROUP  BY md.referencing_id) x ON x.referencing_id = l.object_id
             WHERE  l.depth <= x.max_depth;
 
             SET @moved = @@ROWCOUNT;
             SET @pass  = @pass + 1;
         END
+
+        IF @moved > 0
+            RAISERROR('Module dependency sort hit its 32-pass ceiling; check the emitted order by hand.', 10, 1) WITH NOWAIT;
     END
 
+    -- Views
     INSERT #script (sort_order, sub_order, object_type, schema_name, object_name, script_text)
-    SELECT 900, vl.depth, 'VIEW', s.name, v.name,
+    SELECT 900, ml.depth, 'VIEW', s.name, v.name,
            CASE WHEN @DropIfExists = 1
                 THEN N'IF OBJECT_ID(N''' + REPLACE(QUOTENAME(s.name) + N'.' + QUOTENAME(v.name), N'''', N'''''') +
                      N''', ''V'') IS NOT NULL DROP VIEW ' + QUOTENAME(s.name) + N'.' + QUOTENAME(v.name) + N';' +
@@ -543,17 +731,13 @@ BEGIN
                   N'/* ' + QUOTENAME(s.name) + N'.' + QUOTENAME(v.name) +
                   N' is encrypted (WITH ENCRYPTION); its definition cannot be scripted. */')
     FROM   sys.views v
-    JOIN   sys.schemas s   ON s.schema_id = v.schema_id
-    JOIN   #view_level vl  ON vl.object_id = v.object_id
+    JOIN   sys.schemas s    ON s.schema_id = v.schema_id
+    JOIN   #module_level ml ON ml.object_id = v.object_id
     LEFT   JOIN sys.sql_modules sm ON sm.object_id = v.object_id;
-END
 
---------------------------------------------------------------------------------
--- 10. Functions (scalar, inline TVF, multi-statement TVF)
---------------------------------------------------------------------------------
-IF @IncludeFunctions = 1
-    INSERT #script (sort_order, object_type, schema_name, object_name, script_text)
-    SELECT 1000, 'FUNCTION', s.name, o.name,
+    -- Functions (scalar, inline TVF, multi-statement TVF)
+    INSERT #script (sort_order, sub_order, object_type, schema_name, object_name, script_text)
+    SELECT 900, ml.depth, 'FUNCTION', s.name, o.name,
            CASE WHEN @DropIfExists = 1
                 THEN N'IF OBJECT_ID(N''' + REPLACE(QUOTENAME(s.name) + N'.' + QUOTENAME(o.name), N'''', N'''''') +
                      N''') IS NOT NULL DROP FUNCTION ' + QUOTENAME(s.name) + N'.' + QUOTENAME(o.name) + N';' +
@@ -563,15 +747,14 @@ IF @IncludeFunctions = 1
                   N'/* ' + QUOTENAME(s.name) + N'.' + QUOTENAME(o.name) +
                   N' is encrypted (WITH ENCRYPTION); its definition cannot be scripted. */')
     FROM   sys.objects o
-    JOIN   sys.schemas s ON s.schema_id = o.schema_id
+    JOIN   sys.schemas s    ON s.schema_id = o.schema_id
+    JOIN   #module_level ml ON ml.object_id = o.object_id
     LEFT   JOIN sys.sql_modules sm ON sm.object_id = o.object_id
-    WHERE  o.type IN ('FN', 'IF', 'TF')
-      AND  o.is_ms_shipped = 0
-      AND  (@SchemaFilter IS NULL OR s.name IN (SELECT name FROM #schema_filter))
-      AND  (@NameFilter IS NULL OR o.name LIKE @NameFilter);
+    WHERE  o.type IN ('FN', 'IF', 'TF');
+END
 
 --------------------------------------------------------------------------------
--- 11. Stored procedures
+-- 10. Stored procedures
 --------------------------------------------------------------------------------
 IF @IncludeProcedures = 1
     INSERT #script (sort_order, object_type, schema_name, object_name, script_text)
@@ -590,10 +773,16 @@ IF @IncludeProcedures = 1
     WHERE  p.is_ms_shipped = 0
       AND  p.type = 'P'
       AND  (@SchemaFilter IS NULL OR s.name IN (SELECT name FROM #schema_filter))
-      AND  (@NameFilter IS NULL OR p.name LIKE @NameFilter);
+      AND  (@NameFilter IS NULL OR p.name LIKE @NameFilter)
+      AND  (@ExcludeNameLike IS NULL OR NOT EXISTS
+                (SELECT 1 FROM #exclude_pattern x WHERE p.name LIKE x.pattern))
+      AND  (@CustomObjectsOnly = 0 OR p.name LIKE N'uf[_]%'
+                                   OR p.name LIKE N'Uf[_]%'
+                                   OR p.name LIKE N'MMC[_]%')
+      AND  (@PartCount = 1 OR ABS(CHECKSUM(p.name)) % @PartCount = @PartNumber - 1);
 
 --------------------------------------------------------------------------------
--- 12a. DML triggers
+-- 11a. DML triggers
 --------------------------------------------------------------------------------
 IF @IncludeTriggers = 1
     INSERT #script (sort_order, object_type, schema_name, object_name, script_text)
@@ -617,12 +806,18 @@ IF @IncludeTriggers = 1
     WHERE  tr.is_ms_shipped = 0
       AND  tr.parent_class = 1
       AND  (@SchemaFilter IS NULL OR s.name IN (SELECT name FROM #schema_filter))
-      AND  (@NameFilter IS NULL OR pt.name LIKE @NameFilter);
+      AND  (@NameFilter IS NULL OR pt.name LIKE @NameFilter)
+      AND  (@ExcludeNameLike IS NULL OR NOT EXISTS
+                (SELECT 1 FROM #exclude_pattern x WHERE pt.name LIKE x.pattern))
+      AND  (@CustomObjectsOnly = 0 OR pt.name LIKE N'uf[_]%'
+                                   OR pt.name LIKE N'Uf[_]%'
+                                   OR pt.name LIKE N'MMC[_]%')
+      AND  (@PartCount = 1 OR ABS(CHECKSUM(pt.name)) % @PartCount = @PartNumber - 1);
 
 --------------------------------------------------------------------------------
--- 12b. Database-level DDL triggers (only when not filtering by schema/name)
+-- 11b. Database-level DDL triggers (only when not filtering by schema/name)
 --------------------------------------------------------------------------------
-IF @IncludeTriggers = 1 AND @SchemaFilter IS NULL AND @NameFilter IS NULL
+IF @IncludeTriggers = 1 AND @FirstPart = 1 AND @SchemaFilter IS NULL AND @NameFilter IS NULL
     INSERT #script (sort_order, object_type, schema_name, object_name, script_text)
     SELECT 1210, 'DDL TRIGGER', NULL, tr.name,
            CASE WHEN @DropIfExists = 1
@@ -641,7 +836,7 @@ IF @IncludeTriggers = 1 AND @SchemaFilter IS NULL AND @NameFilter IS NULL
       AND  tr.is_ms_shipped = 0;
 
 --------------------------------------------------------------------------------
--- 13. Foreign keys (last, so every referenced table exists by now)
+-- 12. Foreign keys (last, so every referenced table exists by now)
 --------------------------------------------------------------------------------
 IF @IncludeForeignKeys = 1
     INSERT #script (sort_order, object_type, schema_name, object_name, script_text)
@@ -678,12 +873,18 @@ IF @IncludeForeignKeys = 1
     JOIN   sys.schemas rs ON rs.schema_id = rt.schema_id
     WHERE  fk.is_ms_shipped = 0
       AND  (@SchemaFilter IS NULL OR ps.name IN (SELECT name FROM #schema_filter))
-      AND  (@NameFilter IS NULL OR pt.name LIKE @NameFilter);
+      AND  (@NameFilter IS NULL OR pt.name LIKE @NameFilter)
+      AND  (@ExcludeNameLike IS NULL OR NOT EXISTS
+                (SELECT 1 FROM #exclude_pattern x WHERE pt.name LIKE x.pattern))
+      AND  (@CustomObjectsOnly = 0 OR pt.name LIKE N'uf[_]%'
+                                   OR pt.name LIKE N'Uf[_]%'
+                                   OR pt.name LIKE N'MMC[_]%')
+      AND  (@PartCount = 1 OR ABS(CHECKSUM(pt.name)) % @PartCount = @PartNumber - 1);
 
 --------------------------------------------------------------------------------
--- 14. Synonyms
+-- 13. Synonyms
 --------------------------------------------------------------------------------
-IF @IncludeSynonyms = 1
+IF @IncludeSynonyms = 1 AND @FirstPart = 1
     INSERT #script (sort_order, object_type, schema_name, object_name, script_text)
     SELECT 1400, 'SYNONYM', s.name, sy.name,
            CASE WHEN @DropIfExists = 1
@@ -696,12 +897,17 @@ IF @IncludeSynonyms = 1
     JOIN   sys.schemas s ON s.schema_id = sy.schema_id
     WHERE  sy.is_ms_shipped = 0
       AND  (@SchemaFilter IS NULL OR s.name IN (SELECT name FROM #schema_filter))
-      AND  (@NameFilter IS NULL OR sy.name LIKE @NameFilter);
+      AND  (@NameFilter IS NULL OR sy.name LIKE @NameFilter)
+      AND  (@ExcludeNameLike IS NULL OR NOT EXISTS
+                (SELECT 1 FROM #exclude_pattern x WHERE sy.name LIKE x.pattern))
+      AND  (@CustomObjectsOnly = 0 OR sy.name LIKE N'uf[_]%'
+                                   OR sy.name LIKE N'Uf[_]%'
+                                   OR sy.name LIKE N'MMC[_]%');
 
 --------------------------------------------------------------------------------
--- 15. Extended properties (MS_Description and friends)
+-- 14. Extended properties (MS_Description and friends)
 --------------------------------------------------------------------------------
-IF @IncludeExtendedProperties = 1
+IF @IncludeExtendedProperties = 1 AND @FirstPart = 1
 BEGIN
     -- on schemas
     INSERT #script (sort_order, object_type, schema_name, object_name, script_text)
@@ -739,13 +945,18 @@ BEGIN
       AND  o.type IN ('U', 'V', 'P', 'TR', 'FN', 'IF', 'TF')
       AND  (ep.minor_id = 0 OR COL_NAME(ep.major_id, ep.minor_id) IS NOT NULL)
       AND  (@SchemaFilter IS NULL OR s.name IN (SELECT name FROM #schema_filter))
-      AND  (@NameFilter IS NULL OR o.name LIKE @NameFilter);
+      AND  (@NameFilter IS NULL OR o.name LIKE @NameFilter)
+      AND  (@ExcludeNameLike IS NULL OR NOT EXISTS
+                (SELECT 1 FROM #exclude_pattern x WHERE o.name LIKE x.pattern))
+      AND  (@CustomObjectsOnly = 0 OR o.name LIKE N'uf[_]%'
+                                   OR o.name LIKE N'Uf[_]%'
+                                   OR o.name LIKE N'MMC[_]%');
 END
 
 --------------------------------------------------------------------------------
--- 16. Object-level permissions
+-- 15. Object-level permissions
 --------------------------------------------------------------------------------
-IF @IncludePermissions = 1
+IF @IncludePermissions = 1 AND @FirstPart = 1
     INSERT #script (sort_order, object_type, schema_name, object_name, script_text)
     SELECT 1600, 'PERMISSION', s.name, o.name,
            CASE WHEN perm.state = 'W' THEN N'GRANT' ELSE perm.state_desc END +
@@ -764,7 +975,12 @@ IF @IncludePermissions = 1
       AND  o.is_ms_shipped = 0
       AND  grantee.name <> N'dbo'
       AND  (@SchemaFilter IS NULL OR s.name IN (SELECT name FROM #schema_filter))
-      AND  (@NameFilter IS NULL OR o.name LIKE @NameFilter);
+      AND  (@NameFilter IS NULL OR o.name LIKE @NameFilter)
+      AND  (@ExcludeNameLike IS NULL OR NOT EXISTS
+                (SELECT 1 FROM #exclude_pattern x WHERE o.name LIKE x.pattern))
+      AND  (@CustomObjectsOnly = 0 OR o.name LIKE N'uf[_]%'
+                                   OR o.name LIKE N'Uf[_]%'
+                                   OR o.name LIKE N'MMC[_]%');
 
 --------------------------------------------------------------------------------
 -- Section banners + a script header
@@ -775,8 +991,8 @@ INSERT @sections (base, label) VALUES
     ( 300, 'SEQUENCES'),              ( 400, 'TABLES'),
     ( 500, 'PRIMARY KEY / UNIQUE CONSTRAINTS'),
     ( 600, 'DEFAULT CONSTRAINTS'),    ( 700, 'CHECK CONSTRAINTS'),
-    ( 800, 'INDEXES'),                ( 900, 'VIEWS'),
-    (1000, 'FUNCTIONS'),              (1100, 'STORED PROCEDURES'),
+    ( 800, 'INDEXES'),                ( 900, 'VIEWS AND FUNCTIONS'),
+    (1100, 'STORED PROCEDURES'),
     (1200, 'TRIGGERS'),               (1300, 'FOREIGN KEYS'),
     (1400, 'SYNONYMS'),               (1500, 'EXTENDED PROPERTIES'),
     (1600, 'PERMISSIONS');
@@ -805,8 +1021,13 @@ SELECT 0, -1, 'BANNER',
        N'  Generated ' + CONVERT(nvarchar(30), GETDATE(), 120) +
        N' by Script-Database-Schema.sql' + @crlf +
        N'  ' + CONVERT(nvarchar(10), @stmtCount) + N' statements' + @crlf +
-       REPLICATE(N'=', 76) + N'*/' + @crlf +
-       N'USE ' + QUOTENAME(DB_NAME()) + N';';
+       CASE WHEN @Phase = 99 THEN N'  Phase: all' ELSE N'  Phase: ' + CONVERT(nvarchar(10), @Phase) END +
+       CASE WHEN @PartCount > 1
+            THEN N'   Part ' + CONVERT(nvarchar(10), @PartNumber) + N' of ' + CONVERT(nvarchar(10), @PartCount)
+            ELSE N'' END + @crlf +
+       N'  There is deliberately no USE statement: replay this against whatever' + @crlf +
+       N'  database you connect to, so it cannot overwrite the source by accident.' + @crlf +
+       REPLICATE(N'=', 76) + N'*/';
 
 --------------------------------------------------------------------------------
 -- Output
@@ -868,5 +1089,6 @@ END
 
 DROP TABLE #script;
 DROP TABLE #schema_filter;
-DROP TABLE #view_level;
-IF OBJECT_ID('tempdb..#view_dep') IS NOT NULL DROP TABLE #view_dep;
+DROP TABLE #exclude_pattern;
+DROP TABLE #module_level;
+IF OBJECT_ID('tempdb..#module_dep') IS NOT NULL DROP TABLE #module_dep;
