@@ -1,0 +1,10 @@
+* text=auto
+
+*.sql   text
+*.ps1   text eol=crlf
+*.md    text
+*.csv   text
+
+# Generated schema dumps: collapse them in GitHub's diff view and keep them out
+# of the language stats. They stay diffable when you expand them.
+schema/**/*.sql linguist-generated=true

@@ -1,0 +1,26 @@
+# Database binaries — never in git. These are the whole database, data included.
+*.bak
+*.trn
+*.dif
+*.bacpac
+*.dacpac
+*.mdf
+*.ndf
+*.ldf
+
+# Raw exporter output. Export-SytelineSchema.ps1's default -OutDir lands here;
+# Publish-SchemaExport.ps1 copies the reviewed files into schema/ instead.
+schema-export-*/
+
+# Credentials
+.env
+*.pfx
+*.key
+*.publishsettings
+appsettings.*.json
+connectionstrings*.config
+
+# Scratch
+*.tmp
+*.log
+~$*

@@ -191,3 +191,10 @@ problem before you commit to generating hundreds of megabytes.
 Direct SQL only, so this applies to the on-prem environments (MMC_V10,
 LIVE-BLR). The SaaS sites (CISUS-G, WUXI-S) have no direct SQL access, so
 nothing here runs against them.
+
+## Publishing to GitHub
+
+The export is only half of it — `PUBLISHING.md` covers getting the generated
+files into this repository: what belongs in git, the size limits that decide
+how far to split a phase, and `scripts/Publish-SchemaExport.ps1`, which checks
+an export and commits it.
