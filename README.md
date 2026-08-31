@@ -183,8 +183,10 @@ failing on an unrecognised function.
 
 ## Not yet run against a live instance
 
-There's no SQL Server reachable from the environment this was written in, so it
-is statically checked, not execute-tested. Run phase 0 first and send the output
+`Script-Database-Schema.sql` and the export driver have no SQL Server reachable
+from the environment they were written in, so they are statically checked, not
+execute-tested. (`Publish-SchemaExport.ps1` needs no database and *is* covered
+by `tests/` -- see `PUBLISHING.md`.) Run phase 0 first and send the output
 back, then phase 1 — both are small and will surface any syntax or catalog-shape
 problem before you commit to generating hundreds of megabytes.
 

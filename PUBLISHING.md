@@ -110,3 +110,45 @@ do not belong in a repo, even a private one.
 * If something sensitive does get committed, rewriting history is not enough on
   its own — rotate whatever was exposed, because the old objects can persist in
   forks and caches.
+
+## Running the tests
+
+`Publish-SchemaExport.ps1` touches no database, so it can be tested properly:
+
+```
+pwsh -File ./tests/Test-PublishSchemaExport.ps1
+```
+
+The suite builds a throwaway repo and a fake export under the temp directory and
+checks the things that would otherwise be discovered the hard way — that an
+unchanged export produces no commit, that a dropped object comes through as a
+deletion, and that each guard rail actually refuses rather than warns. It also
+parses every `.ps1` in the repo, which stands in for PSScriptAnalyzer where the
+Gallery is unreachable.
+
+## PowerShell in a Claude Code web session
+
+Those containers are Linux and start without PowerShell, so `.ps1` files can be
+read but not run. `.claude/hooks/session-start.sh` installs it from Microsoft's
+apt repository at session start — idempotent, and a no-op outside the remote
+container. It needs registering in `.claude/settings.json`:
+
+```json
+{
+  "hooks": {
+    "SessionStart": [
+      { "hooks": [ { "type": "command",
+                     "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/session-start.sh" } ] }
+    ]
+  }
+}
+```
+
+On your own machine, if you would rather not install PowerShell directly:
+
+```
+docker run --rm -it -v "${PWD}:/repo" -w /repo mcr.microsoft.com/powershell:latest pwsh
+```
+
+That gets you a shell with the repo mounted. Note the image has no `git` and no
+`sqlcmd`, so it suits running the tests, not the export or the publish.

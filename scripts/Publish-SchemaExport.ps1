@@ -133,7 +133,7 @@ foreach ($f in $files) {
 
 # A generated schema file has no business carrying a password. Catch the two
 # shapes sqlcmd and SSMS leave behind.
-$credentialPattern = '(?i)(pwd|password)\s*=\s*[^;''"\s]+'
+$credentialPattern = '(?i)(pwd|password)\s*=\s*N?[''"]?[^\s;'',")]'
 $scannable = $files | Where-Object {
     $_.Length -lt 20MB -and $_.Extension -match '^\.(sql|txt|md|csv|json|xml|config)$'
 }
@@ -158,7 +158,10 @@ if ($problems.Count -gt 0) {
         if ($Force) { Write-Warning $p } else { Write-Host "ERROR: $p" -ForegroundColor Red }
     }
     if (-not $Force) {
-        throw "$($problems.Count) blocking problem(s). Fix them, or re-run with -Force if you are certain."
+        Write-Host ''
+        Write-Host "$($problems.Count) blocking problem(s). Nothing was committed." -ForegroundColor Red
+        Write-Host 'Fix them, or re-run with -Force if you are certain.'
+        exit 1
     }
 }
 
@@ -198,7 +201,7 @@ $manifest = @(
     "# $Database schema export",
     '',
     "Generated $stamp by ``Export-SytelineSchema.ps1``, published by",
-    '``scripts/Publish-SchemaExport.ps1``. Schema only -- no table data.',
+    '`scripts/Publish-SchemaExport.ps1`. Schema only -- no table data.',
     '',
     '| File | Size | SHA-256 (first 12) |',
     '| --- | --- | --- |'
@@ -212,9 +215,16 @@ Set-Content -LiteralPath (Join-Path $dest 'MANIFEST.md') -Value $manifest -Encod
 
 Invoke-Git @('add', '--', "schema/$Database") | Out-Null
 
-$staged = Invoke-Git @('diff', '--cached', '--name-only', '--', "schema/$Database")
-if (-not $staged) {
-    Write-Host 'No change since the last export -- nothing to commit.'
+$staged = @(Invoke-Git @('diff', '--cached', '--name-only', '--', "schema/$Database"))
+
+# The manifest's timestamp changes on every run. On its own it is not a change
+# worth a commit, so judge by everything else and put it back if that is all
+# there is.
+$meaningful = @($staged | Where-Object { $_ -notmatch 'MANIFEST\.md$' })
+if ($meaningful.Count -eq 0) {
+    Invoke-Git @('reset', '-q', 'HEAD', '--', "schema/$Database") | Out-Null
+    Invoke-Git @('checkout', '--', "schema/$Database") | Out-Null
+    Write-Host 'Schema is unchanged since the last export -- nothing to commit.'
     return
 }
 
