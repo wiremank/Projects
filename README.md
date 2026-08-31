@@ -9,9 +9,10 @@ inventory, then generate one slice at a time and check each before moving on.
 
 | File | What it is |
 | --- | --- |
-| `Phase-0-Inventory.sql` | Sizing report. Writes no DDL. **Run this first.** |
-| `Script-Database-Schema.sql` | The engine. One phase per run, set at the top. |
+| `Script-Database-Schema.sql` | The whole thing. One file, one `@Phase` setting at the top. |
 | `Export-SytelineSchema.ps1` | Optional driver — runs every phase and writes numbered files. |
+
+Written for **SQL Server 2019** (it uses `STRING_AGG`, so 2017+ is required).
 
 Everything is read-only: catalog queries under `READ UNCOMMITTED`, no locks a
 clerk would notice, nothing written to the source database.
@@ -20,7 +21,7 @@ clerk would notice, nothing written to the source database.
 
 | Phase | Contents | Splittable |
 | --- | --- | --- |
-| 0 | Inventory report (separate script) | — |
+| 0 | Inventory report — no DDL | — |
 | 1 | Schemas, alias types, table types, sequences | first part only |
 | 2 | Tables + primary key / unique constraints | yes |
 | 3 | Defaults, check constraints, indexes | yes |
@@ -43,9 +44,12 @@ function, function selecting from a view) and always whole.
 
 ## Start here
 
+Set `@Phase = 0` at the top of `Script-Database-Schema.sql` (that is the
+shipped default) and run it:
+
 ```
 sqlcmd -S <server>\<instance> -d MMC_V10 -E -W -s "|" -y 0 -Y 0 -h -1 ^
-       -i Phase-0-Inventory.sql -o inventory.txt
+       -i Script-Database-Schema.sql -o inventory.txt
 ```
 
 That reports the object census, an estimated output size per phase with a
@@ -55,6 +59,9 @@ definitions, and any encrypted modules that **cannot** be scripted at all.
 
 Read it before generating anything. It tells you whether phase 6 is 20 MB or
 400 MB, which decides how far to split.
+
+In SSMS just open the script and hit execute — phase 0 comes back as result
+grids whatever `@OutputMode` says.
 
 ## Then generate, one phase at a time
 
@@ -68,6 +75,16 @@ DECLARE @PartNumber int = 1;
 
 Run it, then copy the Messages tab into a file. Output is chunked at line
 boundaries, so `PRINT`'s 4000-character cap never truncates anything.
+
+With `@Verbose = 1` (the default) each section reports as it finishes, as a SQL
+comment so it stays valid inside the generated file:
+
+```
+-- [14:22:07] phase 2 starting on [MMC_V10]
+-- [14:22:19] tables: 9812 statements
+```
+
+If a run dies, the last of those lines tells you which section it died in.
 
 **With sqlcmd** — same edit, then:
 
@@ -145,6 +162,8 @@ includes; individual phase files run normally.
 | `@CustomObjectsOnly` | `0` | Keep only `uf_` / `Uf_` / `MMC_` named objects. |
 | `@DropIfExists` | `0` | Prefix modules and synonyms with a drop guard. |
 | `@OrderByDependency` | `1` | Dependency-sort views and functions. |
+| `@Verbose` | `1` | Progress comments with timings, per section. |
+| `@TopN` | `25` | Phase 0: rows in the "largest" / "most" lists. |
 | `@OutputMode` | `'PRINT'` | `PRINT`, `ROWS` (one row per statement), or `SINGLE`. |
 
 ## Deliberate limitations
@@ -158,15 +177,16 @@ includes; individual phase files run normally.
 * Table types get their columns and PK/UNIQUE, not their check or default
   constraints.
 
-Targets SQL Server 2016+ and avoids syntax newer than 2012 (no `STRING_AGG`,
-no `DROP ... IF EXISTS`), so it also runs on older instances.
+Requires SQL Server 2017 or later — `STRING_AGG` does the list building. The
+script checks the version up front and stops with a clear message rather than
+failing on an unrecognised function.
 
 ## Not yet run against a live instance
 
-There's no SQL Server reachable from the environment these were written in, so
-they're statically checked, not execute-tested. Run phase 0 first and send the
-output back, then phase 1 — those two are small and will surface any syntax or
-catalog-shape problem before you commit to generating hundreds of megabytes.
+There's no SQL Server reachable from the environment this was written in, so it
+is statically checked, not execute-tested. Run phase 0 first and send the output
+back, then phase 1 — both are small and will surface any syntax or catalog-shape
+problem before you commit to generating hundreds of megabytes.
 
 Direct SQL only, so this applies to the on-prem environments (MMC_V10,
 LIVE-BLR). The SaaS sites (CISUS-G, WUXI-S) have no direct SQL access, so

@@ -4,7 +4,7 @@
     .sql file per phase, plus a master file that replays them in order.
 
 .DESCRIPTION
-    Phase 0 runs Phase-0-Inventory.sql and writes 00-inventory.txt -- read that
+    Phase 0 runs the engine's inventory and writes 00-inventory.txt -- read that
     before generating anything else. Phases 1..8 then generate the schema:
 
         01-foundation.sql       schemas, alias types, table types, sequences
@@ -79,8 +79,7 @@ param(
     [string]    $SqlLogin,
     [string]    $SqlPassword,
     [int]       $CodePage          = 65001,
-    [string]    $EnginePath        = (Join-Path $PSScriptRoot 'Script-Database-Schema.sql'),
-    [string]    $InventoryPath     = (Join-Path $PSScriptRoot 'Phase-0-Inventory.sql')
+    [string]    $EnginePath        = (Join-Path $PSScriptRoot 'Script-Database-Schema.sql')
 )
 
 $ErrorActionPreference = 'Stop'
@@ -93,9 +92,7 @@ $phaseNames = @{
 if (-not (Get-Command sqlcmd -ErrorAction SilentlyContinue)) {
     throw "sqlcmd was not found on PATH. Install the SQL Server command line tools, or run the .sql files by hand in SSMS."
 }
-foreach ($f in @($EnginePath, $InventoryPath)) {
-    if (-not (Test-Path $f)) { throw "Cannot find $f" }
-}
+if (-not (Test-Path $EnginePath)) { throw "Cannot find $EnginePath" }
 
 if (-not $OutDir) {
     $OutDir = Join-Path (Get-Location) ("schema-export-{0}-{1}" -f $Database, (Get-Date -Format 'yyyyMMdd-HHmm'))
@@ -111,20 +108,22 @@ Write-Host ""
 
 # ---------------------------------------------------------------------------
 function Get-SqlcmdArgs {
-    param([string] $InFile, [string] $OutFile)
+    param([string] $InFile, [string] $OutFile, [switch] $Grid)
 
     $a = @('-S', $Server, '-d', $Database, '-b', '-I', '-t', '0', '-w', '65535',
            '-i', $InFile, '-o', $OutFile)
     if ($SqlLogin) { $a += @('-U', $SqlLogin, '-P', $SqlPassword) } else { $a += '-E' }
     if ($CodePage -gt 0) { $a += @('-f', "$CodePage") }
+    # phase 0 returns result sets, so trim the padding and stop truncation
+    if ($Grid) { $a += @('-W', '-s', '|', '-y', '0', '-Y', '0', '-h', '-1') }
     return $a
 }
 
 function Invoke-Phase {
-    param([string] $InFile, [string] $OutFile, [string] $Label)
+    param([string] $InFile, [string] $OutFile, [string] $Label, [switch] $Grid)
 
     $sw = [Diagnostics.Stopwatch]::StartNew()
-    $sqlArgs = Get-SqlcmdArgs -InFile $InFile -OutFile $OutFile
+    $sqlArgs = Get-SqlcmdArgs -InFile $InFile -OutFile $OutFile -Grid:$Grid
     & sqlcmd $sqlArgs 2>&1 | ForEach-Object { Write-Verbose $_ }
     $code = $LASTEXITCODE
     $sw.Stop()
@@ -181,9 +180,11 @@ $results  = @()
 $replay   = @()
 
 if ($Phases -contains 0) {
-    $results += Invoke-Phase -InFile $InventoryPath `
+    $tmp0 = Join-Path $tempDir 'engine-p0.sql'
+    New-PhaseScript -Phase 0 -PartCount 1 -PartNumber 1 -Path $tmp0
+    $results += Invoke-Phase -InFile  $tmp0 `
                              -OutFile (Join-Path $OutDir '00-inventory.txt') `
-                             -Label   'phase 0  inventory'
+                             -Label   'phase 0  inventory' -Grid
 }
 
 foreach ($phase in ($Phases | Where-Object { $_ -ge 1 -and $_ -le 8 } | Sort-Object)) {
