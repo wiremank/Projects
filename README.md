@@ -183,10 +183,15 @@ failing on an unrecognised function.
 
 ## Not yet run against a live instance
 
-`Script-Database-Schema.sql` and the export driver have no SQL Server reachable
-from the environment they were written in, so they are statically checked, not
-execute-tested. (`Publish-SchemaExport.ps1` needs no database and *is* covered
-by `tests/` -- see `PUBLISHING.md`.) Run phase 0 first and send the output
+`Script-Database-Schema.sql` has no SQL Server reachable from the environment it
+was written in, so it has never been executed. It does parse clean against the
+SQL Server 2019 grammar -- `tests/Test-TSqlSyntax.ps1` checks that with
+Microsoft's own parser on every run -- but syntax is not behaviour: a wrong
+catalog column parses perfectly and fails at run time. Phase 0 first, and read
+its output.
+
+(`Publish-SchemaExport.ps1` needs no database and *is* execute-tested; see
+`PUBLISHING.md`.) Run phase 0 first and send the output
 back, then phase 1 — both are small and will surface any syntax or catalog-shape
 problem before you commit to generating hundreds of megabytes.
 

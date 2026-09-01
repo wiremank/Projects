@@ -24,3 +24,6 @@ connectionstrings*.config
 *.tmp
 *.log
 ~$*
+
+# Cached T-SQL parser, fetched on demand by tests/Test-TSqlSyntax.ps1
+.scriptdom/

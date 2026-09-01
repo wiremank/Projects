@@ -113,18 +113,25 @@ do not belong in a repo, even a private one.
 
 ## Running the tests
 
-`Publish-SchemaExport.ps1` touches no database, so it can be tested properly:
-
 ```
-pwsh -File ./tests/Test-PublishSchemaExport.ps1
+pwsh -File ./tests/Invoke-AllTests.ps1
 ```
 
-The suite builds a throwaway repo and a fake export under the temp directory and
-checks the things that would otherwise be discovered the hard way — that an
-unchanged export produces no commit, that a dropped object comes through as a
-deletion, and that each guard rail actually refuses rather than warns. It also
-parses every `.ps1` in the repo, which stands in for PSScriptAnalyzer where the
-Gallery is unreachable.
+Two suites, neither needing a database:
+
+`Test-PublishSchemaExport.ps1` builds a throwaway repo and a fake export under
+the temp directory and checks the things that would otherwise be discovered the
+hard way — that an unchanged export produces no commit, that a dropped object
+comes through as a deletion, and that each guard rail refuses rather than warns.
+It also parses every `.ps1` in the repo, standing in for PSScriptAnalyzer where
+the Gallery is unreachable.
+
+`Test-TSqlSyntax.ps1` parses every `.sql` file with `TSql150Parser` — Microsoft's
+own T-SQL parser, the SQL Server 2019 grammar, the same one SSMS uses. It fetches
+the parser from NuGet on first run and caches it in `.scriptdom/`, and skips
+rather than fails when NuGet is unreachable. Syntax only: a misspelled catalog
+view parses clean, so it proves the scripter can be loaded, not that it returns
+the right rows.
 
 ## PowerShell in a Claude Code web session
 
